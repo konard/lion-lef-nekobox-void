@@ -1,0 +1,215 @@
+# NekoBox Void Linux Package Build Workflow
+#
+# This workflow builds NekoBox packages for Void Linux on multiple architectures.
+# It uses the void-packages build system (xbps-src) to create native packages.
+#
+# Triggered on:
+# - Git tag pushes (for releases)
+# - Manual workflow dispatch (for testing)
+#
+# Build matrix:
+# - x86_64 (glibc): Standard 64-bit Intel/AMD
+# - x86_64-musl: 64-bit with musl libc
+# - aarch64 (glibc): 64-bit ARM
+# - aarch64-musl: 64-bit ARM with musl libc
+
+name: Build NekoBox for Void Linux
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (leave empty for latest)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    strategy:
+      # Allow all builds to complete even if one fails
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          # Native builds (same arch for host and target)
+          - { host: x86_64, target: x86_64 }
+          - { host: x86_64-musl, target: x86_64-musl }
+          # Cross-compilation builds (x86_64 host building for aarch64)
+          - { host: x86_64, target: aarch64 }
+          - { host: x86_64-musl, target: aarch64-musl }
+    runs-on: ubuntu-22.04
+
+    steps:
+      # Free up disk space for the build
+      # NekoBox builds require significant space for Go modules and Qt
+      - name: Free disk space
+        run: |
+          echo "=== Freeing disk space for build ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /opt/hostedtoolcache/
+          sudo rm -rf /usr/local/graalvm/
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo docker image prune --all --force
+          df -h
+
+      # Checkout this repository (nekobox-void)
+      - name: Checkout nekobox-void
+        uses: actions/checkout@v4
+        with:
+          path: nekobox-void
+
+      # Checkout the official void-packages repository
+      - name: Checkout void-packages
+        uses: actions/checkout@v4
+        with:
+          repository: void-linux/void-packages
+          ref: master
+          path: void-packages
+
+      # Copy our package template into void-packages
+      - name: Copy nekobox into srcpkgs
+        run: |
+          echo "=== Copying nekobox package template ==="
+          cp -rv nekobox-void/srcpkgs/nekobox void-packages/srcpkgs/
+          ls -la void-packages/srcpkgs/nekobox/
+
+      # Download and prepare xbps-static tools
+      - name: Prepare xbps-static
+        run: |
+          echo "=== Setting up xbps-static build tools ==="
+          mkdir -p /opt/xbps
+          curl -LO http://repo-default.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz
+          tar xvf xbps-static-latest.x86_64-musl.tar.xz -C /opt/xbps
+          rm xbps-static-latest.x86_64-musl.tar.xz
+          echo "xbps tools installed:"
+          ls /opt/xbps/usr/bin/
+
+      # Build the package for the target architecture
+      - name: Build NekoBox package
+        env:
+          XBPS_TARGET_ARCH: ${{ matrix.target }}
+        run: |
+          echo "=== Building nekobox for ${{ matrix.target }} ==="
+          export PATH="/opt/xbps/usr/bin/:$PATH"
+          cd void-packages
+
+          if [[ "${{ matrix.host }}" == "${{ matrix.target }}" ]]; then
+            # Native build (same host and target)
+            echo "Native build: host=${{ matrix.host }}, target=${{ matrix.target }}"
+            ./xbps-src -A ${{ matrix.host }} binary-bootstrap
+            ./xbps-src pkg -j$(nproc) -A ${{ matrix.host }} nekobox
+          else
+            # Cross-compilation build
+            echo "Cross build: host=${{ matrix.host }}, target=${{ matrix.target }}"
+            ./xbps-src -a ${{ matrix.target }} -A ${{ matrix.host }} binary-bootstrap
+            ./xbps-src pkg -j$(nproc) -a ${{ matrix.target }} -A ${{ matrix.host }} nekobox
+          fi
+
+          echo "=== Build completed ==="
+          ls -la hostdir/binpkgs/
+
+      # Sign the packages with GPG for authenticity
+      - name: Sign packages
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          XBPS_PASSPHRASE: ${{ secrets.SIGN_PASS }}
+          XBPS_TARGET_ARCH: ${{ matrix.target }}
+        working-directory: void-packages/hostdir/binpkgs/
+        run: |
+          echo "=== Signing packages ==="
+          export PATH="/opt/xbps/usr/bin/:$PATH"
+
+          # Only sign if secrets are available
+          if [ -n "${{ secrets.PRIV_KEY }}" ]; then
+            xbps-rindex -r $PWD
+            xbps-rindex -s --signedby "nekobox-void <noreply@github.com>" \
+              --privkey <(printf '%s' "${{ secrets.PRIV_KEY }}") $PWD
+            xbps-rindex -S --privkey <(printf '%s' "${{ secrets.PRIV_KEY }}") *.xbps
+            xbps-rindex -c $PWD
+            echo "Packages signed successfully"
+          else
+            echo "Signing skipped - no private key configured"
+          fi
+
+      # Generate checksums for integrity verification
+      - name: Generate checksums
+        working-directory: void-packages/hostdir/binpkgs/
+        run: |
+          echo "=== Generating checksums ==="
+          for pkg in *.xbps; do
+            if [ -f "$pkg" ]; then
+              echo "SHA256: $(sha256sum "$pkg")"
+              echo "SHA512: $(sha512sum "$pkg")"
+            fi
+          done
+
+      # Upload build artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nekobox-${{ matrix.target }}
+          path: void-packages/hostdir/binpkgs/*.xbps
+          retention-days: 7
+
+  # Create GitHub Release with all built packages
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Generate release checksums
+        working-directory: packages
+        run: |
+          echo "=== Release packages ==="
+          ls -la
+          echo ""
+          echo "=== SHA256 Checksums ==="
+          sha256sum *.xbps | tee SHA256SUMS.txt
+          echo ""
+          echo "=== SHA512 Checksums ==="
+          sha512sum *.xbps | tee SHA512SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/*.xbps
+            packages/SHA256SUMS.txt
+            packages/SHA512SUMS.txt
+          generate_release_notes: true
+          body: |
+            ## NekoBox for Void Linux
+
+            Prebuilt packages for Void Linux. See the README for installation instructions.
+
+            ### Available Architectures
+            - x86_64 (glibc)
+            - x86_64-musl
+            - aarch64 (glibc)
+            - aarch64-musl
+
+            ### Verify Package Integrity
+            Compare the SHA256 checksum of your downloaded package with the checksums in `SHA256SUMS.txt`.
+            ```
+            sha256sum nekobox-*.xbps
+            ```

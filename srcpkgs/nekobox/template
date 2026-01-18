@@ -53,7 +53,7 @@ pre_configure() {
 
 	# Set Go environment - disable CGO for portability
 	export CGO_ENABLED=0
-	export GOFLAGS="-mod=vendor"
+	export GOFLAGS="-mod=mod"
 
 	# Build sing-box core binary
 	go build -v -trimpath \

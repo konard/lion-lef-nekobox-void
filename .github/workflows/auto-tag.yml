@@ -1,0 +1,193 @@
+# Automatic Version Check and Tag Workflow
+#
+# This workflow automatically checks for new NekoBox upstream releases
+# and creates corresponding tags in this repository to trigger builds.
+#
+# Schedule: Runs every Sunday at 00:00 UTC (weekly check)
+# Manual: Can also be triggered manually via workflow_dispatch
+#
+# Process:
+# 1. Fetches the latest release version from upstream NekoBox
+# 2. Compares with the current version in srcpkgs/nekobox/template
+# 3. If a new version is available:
+#    - Updates the template file with new version and checksum
+#    - Creates a commit and pushes to main
+#    - Creates a git tag matching the upstream version
+# 4. The tag push triggers the build workflow automatically
+
+name: Auto-Tag New Releases
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC (weekly)
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update even if version matches'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-and-tag:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get upstream latest release
+        id: upstream
+        run: |
+          echo "=== Fetching latest NekoBox release ==="
+
+          # Get the latest release info from upstream
+          RELEASE_INFO=$(curl -s https://api.github.com/repos/qr243vbi/nekobox/releases/latest)
+
+          UPSTREAM_VERSION=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          echo "Upstream latest version: $UPSTREAM_VERSION"
+
+          if [ -z "$UPSTREAM_VERSION" ] || [ "$UPSTREAM_VERSION" = "null" ]; then
+            echo "::error::Failed to fetch upstream version"
+            exit 1
+          fi
+
+          echo "version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get current version
+        id: current
+        run: |
+          echo "=== Reading current version from template ==="
+
+          CURRENT_VERSION=$(grep "^version=" srcpkgs/nekobox/template | cut -d'=' -f2)
+          echo "Current version: $CURRENT_VERSION"
+
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if update needed
+        id: check
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          FORCE="${{ inputs.force_update }}"
+
+          echo "Upstream: $UPSTREAM"
+          echo "Current: $CURRENT"
+          echo "Force update: $FORCE"
+
+          if [ "$UPSTREAM" != "$CURRENT" ] || [ "$FORCE" = "true" ]; then
+            echo "Update needed"
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "Already up to date"
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if tag exists
+        id: tag_check
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists"
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag $VERSION does not exist"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download and verify new source
+        id: source
+        if: steps.check.outputs.update_needed == 'true' && steps.tag_check.outputs.tag_exists == 'false'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          echo "=== Downloading source tarball for version $VERSION ==="
+
+          # Download the unified source tarball
+          SOURCE_URL="https://github.com/qr243vbi/nekobox/releases/download/${VERSION}/nekobox-unified-source-${VERSION}.tar.xz"
+
+          curl -fLO "$SOURCE_URL"
+
+          if [ ! -f "nekobox-unified-source-${VERSION}.tar.xz" ]; then
+            echo "::error::Failed to download source tarball"
+            exit 1
+          fi
+
+          # Calculate SHA256 checksum
+          CHECKSUM=$(sha256sum "nekobox-unified-source-${VERSION}.tar.xz" | cut -d' ' -f1)
+          echo "Calculated checksum: $CHECKSUM"
+
+          # Clean up
+          rm -f "nekobox-unified-source-${VERSION}.tar.xz"
+
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+
+      - name: Update template file
+        if: steps.check.outputs.update_needed == 'true' && steps.tag_check.outputs.tag_exists == 'false'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          CHECKSUM="${{ steps.source.outputs.checksum }}"
+
+          echo "=== Updating template file ==="
+          echo "New version: $VERSION"
+          echo "New checksum: $CHECKSUM"
+
+          # Update version
+          sed -i "s/^version=.*/version=$VERSION/" srcpkgs/nekobox/template
+
+          # Update checksum
+          sed -i "s/^checksum=.*/checksum=$CHECKSUM/" srcpkgs/nekobox/template
+
+          # Reset revision to 1 for new version
+          sed -i "s/^revision=.*/revision=1/" srcpkgs/nekobox/template
+
+          echo "=== Updated template ==="
+          grep -E "^(version|revision|checksum)=" srcpkgs/nekobox/template
+
+      - name: Commit and push changes
+        if: steps.check.outputs.update_needed == 'true' && steps.tag_check.outputs.tag_exists == 'false'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add srcpkgs/nekobox/template
+          git commit -m "Update nekobox to version $VERSION"
+          git push origin main
+
+      - name: Create and push tag
+        if: steps.check.outputs.update_needed == 'true' && steps.tag_check.outputs.tag_exists == 'false'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+
+          echo "=== Creating tag $VERSION ==="
+
+          git tag -a "$VERSION" -m "NekoBox version $VERSION"
+          git push origin "$VERSION"
+
+          echo "Tag $VERSION created and pushed successfully"
+
+      - name: Summary
+        run: |
+          echo "## Auto-Tag Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Version:** ${{ steps.upstream.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Current Version:** ${{ steps.current.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Update Needed:** ${{ steps.check.outputs.update_needed }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check.outputs.update_needed }}" = "true" ] && [ "${{ steps.tag_check.outputs.tag_exists }}" = "false" ]; then
+            echo "- **Action:** Created tag ${{ steps.upstream.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.tag_check.outputs.tag_exists }}" = "true" ]; then
+            echo "- **Action:** Tag already exists, skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Action:** No update needed" >> $GITHUB_STEP_SUMMARY
+          fi
